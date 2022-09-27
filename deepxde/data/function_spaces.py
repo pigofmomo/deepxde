@@ -14,6 +14,8 @@ import numpy as np
 from scipy import linalg, interpolate
 from sklearn import gaussian_process as gp
 
+from .. import config
+
 
 class FunctionSpace(abc.ABC):
     """Function space base class.
@@ -128,8 +130,10 @@ class GRF(FunctionSpace):
 
     Args:
         T (float): `T` > 0. The domain is [0, `T`].
-        kernel (str): The kernel function. "RBF" (radial-basis function) or "AE"
-            (absolute exponential).
+        kernel (str): Name of the kernel function. "RBF" (radial-basis function kernel,
+            squared-exponential kernel, Gaussian kernel), "AE"
+            (absolute exponential kernel), or "ExpSineSquared" (Exp-Sine-Squared kernel,
+            periodic kernel).
         length_scale (float): The length scale of the kernel.
         N (int): The size of the covariance matrix.
         interp (str): The interpolation to interpolate the random function. "linear",
@@ -144,6 +148,8 @@ class GRF(FunctionSpace):
             K = gp.kernels.RBF(length_scale=length_scale)
         elif kernel == "AE":
             K = gp.kernels.Matern(length_scale=length_scale, nu=0.5)
+        elif kernel == "ExpSineSquared":
+            K = gp.kernels.ExpSineSquared(length_scale=length_scale, periodicity=T)
         self.K = K(self.x)
         self.L = np.linalg.cholesky(self.K + 1e-13 * np.eye(self.N))
 
@@ -168,7 +174,7 @@ class GRF(FunctionSpace):
             )(xs).T,
             features,
         )
-        return np.vstack(list(res))
+        return np.vstack(list(res)).astype(config.real(np))
 
 
 class GRF_KL(FunctionSpace):
