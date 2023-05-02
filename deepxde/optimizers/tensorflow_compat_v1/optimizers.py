@@ -3,6 +3,7 @@ __all__ = ["get", "is_external_optimizer"]
 from .scipy_optimizer import ScipyOptimizerInterface
 from ..config import LBFGS_options
 from ...backend import tf
+from ...config import hvd
 
 
 def is_external_optimizer(optimizer):
@@ -41,9 +42,9 @@ def get(loss, optimizer, learning_rate=None, decay=None):
         elif optimizer == "sgdnesterov":
             optim = tf.train.MomentumOptimizer(lr, 0.9, use_nesterov=True)
         elif optimizer == "adagrad":
-            optim = tf.train.AdagradOptimizer(0.01)
+            optim = tf.train.AdagradOptimizer(lr)
         elif optimizer == "adadelta":
-            optim = tf.train.AdadeltaOptimizer()
+            optim = tf.train.AdadeltaOptimizer(lr)
         elif optimizer == "rmsprop":
             optim = tf.train.RMSPropOptimizer(lr)
         elif optimizer == "adam":
@@ -54,6 +55,8 @@ def get(loss, optimizer, learning_rate=None, decay=None):
             )
 
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    if hvd is not None:
+        optim = hvd.DistributedOptimizer(optim)
     with tf.control_dependencies(update_ops):
         train_op = optim.minimize(loss, global_step=global_step)
     return train_op

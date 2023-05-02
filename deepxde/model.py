@@ -14,6 +14,7 @@ from . import optimizers
 from . import utils
 from .backend import backend_name, tf, torch, jax, paddle
 from .callbacks import CallbackList
+from .utils import list_to_str
 
 
 class Model:
@@ -47,7 +48,7 @@ class Model:
         if backend_name == "tensorflow.compat.v1":
             self.sess = None
             self.saver = None
-        elif backend_name == "pytorch":
+        elif backend_name in ["pytorch", "paddle"]:
             self.lr_scheduler = None
         elif backend_name == "jax":
             self.opt_state = None
@@ -93,6 +94,12 @@ class Model:
 
                     - `StepLR <https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.StepLR.html>`_: ("step", step_size, gamma)
 
+                - For backend PaddlePaddle:
+
+                    - `InverseTimeDecay
+                      <https://www.paddlepaddle.org.cn/documentation/docs/en/develop/api/paddle/optimizer/lr/InverseTimeDecay_en.html>`_:
+                      ("inverse time", gamma)
+
             loss_weights: A list specifying scalar coefficients (Python floats) to
                 weight the loss contributions. The loss value that will be minimized by
                 the model will then be the weighted sum of all individual losses,
@@ -103,7 +110,8 @@ class Model:
                 tensorflow.compat.v1, `external_trainable_variables` is ignored, and all
                 trainable ``dde.Variable`` objects are automatically collected.
         """
-        print("Compiling model...")
+        if config.rank == 0:
+            print("Compiling model...")
         self.opt_name = optimizer
         loss_fn = losses_module.get(loss)
         self.losshistory.set_loss_weights(loss_weights)
@@ -145,6 +153,10 @@ class Model:
                 cfg.graph_options.optimizer_options.global_jit_level = (
                     tf.OptimizerOptions.ON_2
                 )
+                self.sess = tf.Session(config=cfg)
+            elif config.hvd is not None:
+                cfg = tf.ConfigProto()
+                cfg.gpu_options.visible_device_list = str(config.rank)
                 self.sess = tf.Session(config=cfg)
             else:
                 self.sess = tf.Session()
@@ -264,6 +276,8 @@ class Model:
                 else:
                     inputs = torch.as_tensor(inputs)
                     inputs.requires_grad_()
+            # Clear cached Jacobians and Hessians.
+            grad.clear()
             return self.net(inputs)
 
         def outputs_losses(training, inputs, targets, losses_fn):
@@ -412,7 +426,8 @@ class Model:
                     inputs = paddle.to_tensor(inputs, stop_gradient=False)
                 return self.net(inputs)
 
-        def outputs_losses(training, inputs, targets, losses_fn):
+        def outputs_losses(training, inputs, targets, auxiliary_vars, losses_fn):
+            self.net.auxiliary_vars = auxiliary_vars
             if training:
                 self.net.train()
             else:
@@ -424,7 +439,6 @@ class Model:
                 )
             else:
                 inputs = paddle.to_tensor(inputs, stop_gradient=False)
-
             outputs_ = self.net(inputs)
             # Data losses
             if targets is not None:
@@ -441,11 +455,15 @@ class Model:
             grad.clear()
             return outputs_, losses
 
-        def outputs_losses_train(inputs, targets):
-            return outputs_losses(True, inputs, targets, self.data.losses_train)
+        def outputs_losses_train(inputs, targets, auxiliary_vars):
+            return outputs_losses(
+                True, inputs, targets, auxiliary_vars, self.data.losses_train
+            )
 
-        def outputs_losses_test(inputs, targets):
-            return outputs_losses(False, inputs, targets, self.data.losses_test)
+        def outputs_losses_test(inputs, targets, auxiliary_vars):
+            return outputs_losses(
+                False, inputs, targets, auxiliary_vars, self.data.losses_test
+            )
 
         trainable_variables = (
             list(self.net.parameters()) + self.external_trainable_variables
@@ -454,18 +472,34 @@ class Model:
             trainable_variables, self.opt_name, learning_rate=lr, decay=decay
         )
 
-        def train_step(inputs, targets):
-            losses = outputs_losses_train(inputs, targets)[1]
+        def train_step(inputs, targets, auxiliary_vars):
+            losses = outputs_losses_train(inputs, targets, auxiliary_vars)[1]
             total_loss = paddle.sum(losses)
             total_loss.backward()
             self.opt.step()
             self.opt.clear_grad()
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+
+        def train_step_lbfgs(inputs, targets, auxiliary_vars):
+            def closure():
+                losses = outputs_losses_train(inputs, targets, auxiliary_vars)[1]
+                total_loss = paddle.sum(losses)
+                self.opt.clear_grad()
+                total_loss.backward()
+                return total_loss
+
+            self.opt.step(closure)
 
         # Callables
         self.outputs = outputs
         self.outputs_losses_train = outputs_losses_train
         self.outputs_losses_test = outputs_losses_test
-        self.train_step = train_step
+        self.train_step = (
+            train_step
+            if not optimizers.is_external_optimizer(self.opt_name)
+            else train_step_lbfgs
+        )
 
     def _outputs(self, training, inputs):
         if backend_name == "tensorflow.compat.v1":
@@ -496,16 +530,16 @@ class Model:
             # TODO: auxiliary_vars
             outs = outputs_losses(self.params, inputs, targets)
         elif backend_name == "paddle":
-            outs = outputs_losses(inputs, targets)
+            outs = outputs_losses(inputs, targets, auxiliary_vars)
         return utils.to_numpy(outs[0]), utils.to_numpy(outs[1])
 
     def _train_step(self, inputs, targets, auxiliary_vars):
         if backend_name == "tensorflow.compat.v1":
             feed_dict = self.net.feed_dict(True, inputs, targets, auxiliary_vars)
             self.sess.run(self.train_step, feed_dict=feed_dict)
-        elif backend_name == "tensorflow":
+        elif backend_name in ["tensorflow", "paddle"]:
             self.train_step(inputs, targets, auxiliary_vars)
-        elif backend_name in ["pytorch", "paddle"]:
+        elif backend_name == "pytorch":
             # TODO: auxiliary_vars
             self.train_step(inputs, targets)
         elif backend_name == "jax":
@@ -532,11 +566,16 @@ class Model:
         Args:
             iterations (Integer): Number of iterations to train the model, i.e., number
                 of times the network weights are updated.
-            batch_size: Integer or ``None``. If you solve PDEs via ``dde.data.PDE`` or
-                ``dde.data.TimePDE``, do not use `batch_size`, and instead use
-                `dde.callbacks.PDEResidualResampler
-                <https://deepxde.readthedocs.io/en/latest/modules/deepxde.html#deepxde.callbacks.PDEResidualResampler>`_,
-                see an `example <https://github.com/lululxvi/deepxde/blob/master/examples/diffusion_1d_resample.py>`_.
+            batch_size: Integer, tuple, or ``None``.
+
+                - If you solve PDEs via ``dde.data.PDE`` or ``dde.data.TimePDE``, do not use `batch_size`, and instead use
+                  `dde.callbacks.PDEPointResampler
+                  <https://deepxde.readthedocs.io/en/latest/modules/deepxde.html#deepxde.callbacks.PDEPointResampler>`_,
+                  see an `example <https://github.com/lululxvi/deepxde/blob/master/examples/diffusion_1d_resample.py>`_.
+                - For DeepONet in the format of Cartesian product, if `batch_size` is an Integer,
+                  then it is the batch size for the branch input; if you want to also use mini-batch for the trunk net input,
+                  set `batch_size` as a tuple, where the fist number is the batch size for the branch net input
+                  and the second number is the batch size for the trunk net input.
             display_every (Integer): Print the loss and metrics every this steps.
             disregard_previous_best: If ``True``, disregard the previous saved best
                 model.
@@ -553,7 +592,6 @@ class Model:
                 " Use iterations instead."
             )
             iterations = epochs
-
         self.batch_size = batch_size
         self.callbacks = CallbackList(callbacks=callbacks)
         self.callbacks.set_model(self)
@@ -562,15 +600,18 @@ class Model:
 
         if backend_name == "tensorflow.compat.v1":
             if self.train_state.step == 0:
-                print("Initializing variables...")
                 self.sess.run(tf.global_variables_initializer())
+                if config.hvd is not None:
+                    bcast = config.hvd.broadcast_global_variables(0)
+                    self.sess.run(bcast)
             else:
                 utils.guarantee_initialized_variables(self.sess)
 
         if model_restore_path is not None:
             self.restore(model_restore_path, verbose=1)
 
-        print("Training model...\n")
+        if config.rank == 0:
+            print("Training model...\n")
         self.stop_training = False
         self.train_state.set_data_train(*self.data.train_next_batch(self.batch_size))
         self.train_state.set_data_test(*self.data.test())
@@ -583,14 +624,17 @@ class Model:
                 self._train_tensorflow_tfp()
             elif backend_name == "pytorch":
                 self._train_pytorch_lbfgs()
+            elif backend_name == "paddle":
+                self._train_paddle_lbfgs()
         else:
             if iterations is None:
                 raise ValueError("No iterations for {}.".format(self.opt_name))
             self._train_sgd(iterations, display_every)
         self.callbacks.on_train_end()
 
-        print("")
-        display.training_display.summary(self.train_state)
+        if config.rank == 0:
+            print("")
+            display.training_display.summary(self.train_state)
         if model_save_path is not None:
             self.save(model_save_path, verbose=1)
         return self.losshistory, self.train_state
@@ -621,17 +665,35 @@ class Model:
                 break
 
     def _train_tensorflow_compat_v1_scipy(self, display_every):
-        def loss_callback(loss_train):
+        def loss_callback(loss_train, loss_test, *args):
             self.train_state.epoch += 1
             self.train_state.step += 1
             if self.train_state.step % display_every == 0:
                 self.train_state.loss_train = loss_train
-                self.train_state.loss_test = None
+                self.train_state.loss_test = loss_test
                 self.train_state.metrics_test = None
                 self.losshistory.append(
-                    self.train_state.step, self.train_state.loss_train, None, None
+                    self.train_state.step,
+                    self.train_state.loss_train,
+                    self.train_state.loss_test,
+                    None,
                 )
                 display.training_display(self.train_state)
+            for cb in self.callbacks.callbacks:
+                if type(cb).__name__ == "VariableValue":
+                    cb.epochs_since_last += 1
+                    if cb.epochs_since_last >= cb.period:
+                        cb.epochs_since_last = 0
+
+                        print(
+                            cb.model.train_state.epoch,
+                            list_to_str(
+                                [float(arg) for arg in args],
+                                precision=cb.precision,
+                            ),
+                            file=cb.file,
+                        )
+                        cb.file.flush()
 
         self.train_state.set_data_train(*self.data.train_next_batch(self.batch_size))
         feed_dict = self.net.feed_dict(
@@ -640,10 +702,13 @@ class Model:
             self.train_state.y_train,
             self.train_state.train_aux_vars,
         )
+        fetches = [self.outputs_losses_train[1], self.outputs_losses_test[1]]
+        if self.external_trainable_variables:
+            fetches += self.external_trainable_variables
         self.train_step.minimize(
             self.sess,
             feed_dict=feed_dict,
-            fetches=[self.outputs_losses_train[1]],
+            fetches=fetches,
             loss_callback=loss_callback,
         )
         self._test()
@@ -702,7 +767,40 @@ class Model:
             if self.stop_training:
                 break
 
+    def _train_paddle_lbfgs(self):
+        prev_n_iter = 0
+
+        while prev_n_iter < optimizers.LBFGS_options["maxiter"]:
+            self.callbacks.on_epoch_begin()
+            self.callbacks.on_batch_begin()
+
+            self.train_state.set_data_train(
+                *self.data.train_next_batch(self.batch_size)
+            )
+            self._train_step(
+                self.train_state.X_train,
+                self.train_state.y_train,
+                self.train_state.train_aux_vars,
+            )
+
+            n_iter = self.opt.state_dict()["state"]["n_iter"]
+            if prev_n_iter == n_iter:
+                # Converged
+                break
+
+            self.train_state.epoch += n_iter - prev_n_iter
+            self.train_state.step += n_iter - prev_n_iter
+            prev_n_iter = n_iter
+            self._test()
+
+            self.callbacks.on_batch_end()
+            self.callbacks.on_epoch_end()
+
+            if self.stop_training:
+                break
+
     def _test(self):
+        # TODO Now only print the training loss in rank 0. The correct way is to print the average training loss of all ranks.
         (
             self.train_state.y_pred_train,
             self.train_state.loss_train,
@@ -744,7 +842,8 @@ class Model:
             or np.isnan(self.train_state.loss_test).any()
         ):
             self.stop_training = True
-        display.training_display(self.train_state)
+        if config.rank == 0:
+            display.training_display(self.train_state)
 
     def predict(self, x, operator=None, callbacks=None):
         """Generates predictions for the input samples. If `operator` is ``None``,
@@ -818,6 +917,8 @@ class Model:
                     "Model.predict() with auxiliary variable hasn't been implemented "
                     "for backend pytorch."
                 )
+            # Clear cached Jacobians and Hessians.
+            grad.clear()
             y = utils.to_numpy(y)
         elif backend_name == "paddle":
             self.net.eval()
@@ -844,13 +945,20 @@ class Model:
 
     def state_dict(self):
         """Returns a dictionary containing all variables."""
-        # TODO: backend tensorflow
         if backend_name == "tensorflow.compat.v1":
             destination = OrderedDict()
             variables_names = [v.name for v in tf.global_variables()]
             values = self.sess.run(variables_names)
             for k, v in zip(variables_names, values):
                 destination[k] = v
+        elif backend_name == "tensorflow":
+            # user-provided variables
+            destination = {
+                f"external_trainable_variable:{i}": v
+                for (i, v) in enumerate(self.external_trainable_variables)
+            }
+            # the paramaters of the net
+            destination.update(self.net.get_weight_paths())
         elif backend_name in ["pytorch", "paddle"]:
             destination = self.net.state_dict()
         else:
@@ -870,7 +978,7 @@ class Model:
                 - For "tensorflow.compat.v1", use `tf.train.Save <https://www.tensorflow.org/api_docs/python/tf/compat/v1/train/Saver#attributes>`_.
                 - For "tensorflow", use `tf.keras.Model.save_weights <https://www.tensorflow.org/api_docs/python/tf/keras/Model#save_weights>`_.
                 - For "pytorch", use `torch.save <https://pytorch.org/docs/stable/generated/torch.save.html>`_.
-                - For "paddle", use `paddle.save <https://www.paddlepaddle.org.cn/documentation/docs/zh/api/paddle/save_cn.html#cn-api-paddle-framework-io-save>`_.
+                - For "paddle", use `paddle.save <https://www.paddlepaddle.org.cn/documentation/docs/en/api/paddle/save_en.html>`_.
 
                 If `protocol` is "pickle", save using the Python pickle module. Only the
                 protocol "backend" supports ``restore()``.
@@ -917,13 +1025,18 @@ class Model:
             )
         return save_path
 
-    def restore(self, save_path, verbose=0):
+    def restore(self, save_path, device=None, verbose=0):
         """Restore all variables from a disk file.
 
         Args:
             save_path (string): Path where model was previously saved.
+            device (string, optional): Device to load the model on (e.g. "cpu","cuda:0"...). By default, the model is loaded on the device it was saved from.
         """
         # TODO: backend tensorflow
+        if device is not None and backend_name != "pytorch":
+            print(
+                "Warning: device is only supported for backend pytorch. Model will be loaded on the device it was saved from."
+            )
         if verbose > 0:
             print("Restoring model from {} ...\n".format(save_path))
         if backend_name == "tensorflow.compat.v1":
@@ -931,7 +1044,10 @@ class Model:
         elif backend_name == "tensorflow":
             self.net.load_weights(save_path)
         elif backend_name == "pytorch":
-            checkpoint = torch.load(save_path)
+            if device is not None:
+                checkpoint = torch.load(save_path, map_location=torch.device(device))
+            else:
+                checkpoint = torch.load(save_path)
             self.net.load_state_dict(checkpoint["model_state_dict"])
             self.opt.load_state_dict(checkpoint["optimizer_state_dict"])
         elif backend_name == "paddle":

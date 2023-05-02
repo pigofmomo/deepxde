@@ -26,7 +26,14 @@ class FNN(NN):
     ):
         super().__init__()
         self.layer_size = layer_sizes
-        self.activation = activations.get(activation)
+        if isinstance(activation, list):
+            if not (len(layer_sizes) - 1) == len(activation):
+                raise ValueError(
+                    "Total number of activation functions do not match with sum of hidden layers and output layer!"
+                )
+            self.activation = list(map(activations.get, activation))
+        else:
+            self.activation = activations.get(activation)
         self.kernel_initializer = initializers.get(kernel_initializer)
         self.regularizer = regularizers.get(regularization)
         self.dropout_rate = dropout_rate
@@ -60,7 +67,11 @@ class FNN(NN):
                 y = self._dense(
                     y,
                     self.layer_size[i + 1],
-                    activation=self.activation,
+                    activation=(
+                        self.activation[i]
+                        if isinstance(self.activation, list)
+                        else self.activation
+                    ),
                     use_bias=self.use_bias,
                 )
             elif self.batch_normalization and self.layer_normalization:
@@ -81,6 +92,8 @@ class FNN(NN):
                     "batch_normalization: {}, layer_normalization: {}".format(
                         self.batch_normalization, self.layer_normalization
                     )
+                    + "\n'before' and 'after' are the only acceptable values for"
+                    + " batch_normalization and layer_normalization."
                 )
             if self.dropout_rate > 0:
                 y = tf.layers.dropout(y, rate=self.dropout_rate, training=self.training)
@@ -144,7 +157,6 @@ class FNN(NN):
         """
 
         with tf.variable_scope("layer_norm"):
-
             mean, var = tf.nn.moments(inputs, axes=[1], keepdims=True)
 
             if elementwise_affine:
