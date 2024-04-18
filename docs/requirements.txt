@@ -20,3 +20,4 @@ optax
 docutils<0.18  # https://github.com/readthedocs/readthedocs.org/issues/8616
 sphinx-copybutton
 protobuf==3.20.*
+keras>=2.13.1rc0 # not directly required, pinned by Snyk to avoid a vulnerability
